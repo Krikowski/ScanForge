@@ -20,3 +20,8 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+ScanForge/.vs/ScanForge/config/applicationhost.config
+ScanForge/.vs/ScanForge/FileContentIndex/a80e03c9-2b0b-431c-a957-fb30d54f3953.vsidx
+ScanForge/.vs/ScanForge/v17/.suo
+ScanForge/.vs/ScanForge/v17/DocumentLayout.backup.json
+ScanForge/.vs/ScanForge/v17/DocumentLayout.json
