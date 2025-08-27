@@ -25,3 +25,11 @@ ScanForge/.vs/ScanForge/FileContentIndex/a80e03c9-2b0b-431c-a957-fb30d54f3953.vs
 ScanForge/.vs/ScanForge/v17/.suo
 ScanForge/.vs/ScanForge/v17/DocumentLayout.backup.json
 ScanForge/.vs/ScanForge/v17/DocumentLayout.json
+*/ScanForge/bin
+*/ScanForge/.vs*
+*/ScanForge/obj
+*/ScanForge/obj/Debug
+/ScanForge/obj*
+*.json
+*.cache
+*/ScanForge/obj/*
