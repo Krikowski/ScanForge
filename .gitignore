@@ -33,3 +33,4 @@ ScanForge/.vs/ScanForge/v17/DocumentLayout.json
 *.json
 *.cache
 */ScanForge/obj/*
+/ScanForge/.vs/ScanForge
