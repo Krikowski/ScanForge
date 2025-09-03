@@ -1,34 +1,36 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using ScanForge.Data;
+using ScanForge.Services;
 
 namespace ScanForge {
     public class Program {
-        public static void Main(string[] args) {
-            var builder = WebApplication.CreateBuilder(args);
+        public static async Task Main(string[] args) {
+            var builder = Host.CreateDefaultBuilder(args);
 
-            // Add services to the container.
+            // Configurar serviços
+            builder.ConfigureServices((hostContext, services) => {
+                // Registrar o Worker Service para consumir mensagens do RabbitMQ
+                services.AddHostedService<RabbitMqConsumerService>();
 
-            builder.Services.AddControllers();
-            // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
-            builder.Services.AddEndpointsApiExplorer();
-            builder.Services.AddSwaggerGen();
-            
-            builder.Services.AddHostedService<ScanForge.Service.RabbitMqConsumerService>();
+                // Configurar conexão com o banco de dados PostgreSQL
+                services.AddDbContext<VideoDbContext>(options =>
+                    options.UseNpgsql(hostContext.Configuration.GetConnectionString("DefaultConnection")));
 
-            var app = builder.Build();
+                // Configurar logging para console com nível mínimo de Information
+                services.AddLogging(logging => {
+                    logging.AddConsole();
+                    logging.SetMinimumLevel(LogLevel.Information);
+                });
 
-            // Configure the HTTP request pipeline.
-            if (app.Environment.IsDevelopment()) {
-                app.UseSwagger();
-                app.UseSwaggerUI();
-            }
+                // Registrar IConfiguration para o Worker Service
+                services.AddSingleton(hostContext.Configuration);
+            });
 
-            app.UseHttpsRedirection();
-
-            app.UseAuthorization();
-
-
-            app.MapControllers();
-
-            app.Run();
+            // Criar e executar o host
+            var host = builder.Build();
+            await host.RunAsync();
         }
     }
 }
