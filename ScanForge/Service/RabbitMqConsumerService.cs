@@ -1,83 +1,122 @@
-﻿using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using Newtonsoft.Json;
+﻿using Newtonsoft.Json;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using System;
-using System.IO;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
 using ScanForge.Data;
 using ScanForge.Models;
 using Xabe.FFmpeg;
+using Microsoft.EntityFrameworkCore;
+using ZXing;
+using ZXing.Windows.Compatibility;
+using System.Drawing;
+using System.Collections.Generic;
+using System.Linq;
+using System.IO;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+using System.Collections.Concurrent;
+using System.Threading;
 
 namespace ScanForge.Services {
     public class RabbitMqConsumerService : BackgroundService {
-        private readonly ILogger _logger; private readonly IServiceScopeFactory _scopeFactory; private readonly IConnection _connection; private readonly IModel _channel; private readonly string _queueName;
+        private readonly ILogger<RabbitMqConsumerService> _logger;
+        private readonly IServiceScopeFactory _scopeFactory;
+        private IConnection _connection;
+        private IModel _channel;
+        private readonly string _queueName;
+        private readonly string _videoBasePath;
+        private readonly string _ffmpegPath;
+        private readonly ConnectionFactory _factory;
 
         public RabbitMqConsumerService(ILogger<RabbitMqConsumerService> logger, IServiceScopeFactory scopeFactory, IConfiguration configuration) {
             _logger = logger;
             _scopeFactory = scopeFactory;
-            _queueName = configuration.GetSection("RabbitMQ:QueueName").Value ?? "video_queue";
+            _queueName = configuration["RabbitMQ:QueueName"] ?? "video_queue";
+            _videoBasePath = configuration["VideoStorage:BasePath"] ?? "C:\\videos";
+            _ffmpegPath = configuration["FFmpeg:Path"] ?? "C:\\ffmpeg\\bin";
 
-            try {
-                var factory = new ConnectionFactory {
-                    HostName = configuration.GetSection("RabbitMQ:HostName").Value ?? "rabbitmq",
-                    UserName = configuration.GetSection("RabbitMQ:UserName").Value ?? "admin",
-                    Password = configuration.GetSection("RabbitMQ:Password").Value ?? "admin",
-                    Port = int.Parse(configuration.GetSection("RabbitMQ:Port").Value ?? "5672"),
-                    RequestedConnectionTimeout = TimeSpan.FromSeconds(30)
-                };
+            _factory = new ConnectionFactory {
+                HostName = configuration["RabbitMQ:HostName"] ?? "host.docker.internal",
+                UserName = configuration["RabbitMQ:UserName"] ?? "admin",
+                Password = configuration["RabbitMQ:Password"] ?? "admin",
+                Port = int.Parse(configuration["RabbitMQ:Port"] ?? "5672"),
+                RequestedHeartbeat = TimeSpan.FromSeconds(60),
+                AutomaticRecoveryEnabled = true
+            };
 
-                _logger.LogInformation("Tentando conectar ao RabbitMQ em {HostName}:{Port} para a fila {QueueName}", factory.HostName, factory.Port, _queueName);
+            ConnectWithRetry();
+        }
 
-                _connection = factory.CreateConnection();
-                _channel = _connection.CreateModel();
-                _logger.LogInformation("Conexão com RabbitMQ estabelecida com sucesso para a fila {QueueName}", _queueName);
-            } catch (Exception ex) {
-                _logger.LogError(ex, "Falha ao conectar ao RabbitMQ para a fila {QueueName}", _queueName);
-                throw;
+        private void ConnectWithRetry() {
+            int retryCount = 0;
+            int maxRetries = 5;
+            int delayMs = 5000;
+
+            while (retryCount < maxRetries) {
+                try {
+                    _logger.LogInformation("Tentando conectar ao RabbitMQ em {HostName}:{Port} com usuário {UserName}", _factory.HostName, _factory.Port, _factory.UserName);
+                    _connection = _factory.CreateConnection();
+                    _channel = _connection.CreateModel();
+                    _channel.QueueDeclare(queue: _queueName, durable: true, exclusive: false, autoDelete: false, arguments: null);
+                    _logger.LogInformation("Conexão com RabbitMQ estabelecida com sucesso para a fila {QueueName}", _queueName);
+                    return;
+                } catch (Exception ex) {
+                    retryCount++;
+                    _logger.LogError(ex, "Falha ao conectar ao RabbitMQ (tentativa {RetryCount}/{MaxRetries})", retryCount, maxRetries);
+                    if (retryCount >= maxRetries) {
+                        throw new Exception("Não foi possível conectar ao RabbitMQ após várias tentativas", ex);
+                    }
+                    Thread.Sleep(delayMs);
+                }
             }
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken) {
-            _logger.LogInformation("RabbitMqConsumerService iniciado, aguardando mensagens na fila {QueueName}...", _queueName);
+            FFmpeg.SetExecutablesPath(_ffmpegPath);
+            _logger.LogInformation("FFmpeg configurado em {FFmpegPath}", _ffmpegPath);
 
             var consumer = new EventingBasicConsumer(_channel);
-            consumer.Received += async (model, ea) =>
-            {
+            consumer.Received += async (model, ea) => {
                 try {
                     var body = ea.Body.ToArray();
                     var message = Encoding.UTF8.GetString(body);
-                    _logger.LogInformation("Mensagem recebida na fila {QueueName}: {Message}", _queueName, message);
-
-                    // Desserializar a mensagem
                     var videoMessage = JsonConvert.DeserializeObject<VideoMessage>(message);
 
-                    // Determinar o FilePath com base no ambiente
-                    string mappedFilePath;
-                    if (Environment.OSVersion.Platform == PlatformID.Win32NT) {
-                        // No Windows, usar o FilePath original
-                        mappedFilePath = videoMessage.FilePath.Replace("/", "\\"); // Normaliza para \
+                    // Usar o FilePath diretamente, garantindo compatibilidade com Windows
+                    var mappedFilePath = videoMessage.FilePath;
+                    if (mappedFilePath.StartsWith("/app/videos")) {
+                        var fileName = Path.GetFileName(videoMessage.FilePath);
+                        mappedFilePath = Path.Combine(_videoBasePath, fileName).Replace("/", "\\").Trim();
                     } else {
-                        // No Docker (Linux), mapear para /videos
-                        var fileName = Path.GetFileName(videoMessage.FilePath.Replace("\\", "/"));
-                        mappedFilePath = Path.Combine("/videos", fileName).Replace("\\", "/"); // Garante /videos/teste.mp4
+                        mappedFilePath = videoMessage.FilePath.Replace("/", "\\").Trim().Replace("\r", "").Replace("\n", "");
                     }
-                    _logger.LogInformation("FilePath original: {OriginalPath}, FilePath mapeado: {MappedPath}", videoMessage.FilePath, mappedFilePath);
 
-                    // Listar arquivos no diretório para depuração
-                    var videoDir = Path.GetDirectoryName(mappedFilePath);
-                    var videoFiles = Directory.Exists(videoDir) ? Directory.GetFiles(videoDir) : Array.Empty<string>();
-                    _logger.LogInformation("Arquivos no diretório {VideoDir}: {Files}", videoDir, string.Join(", ", videoFiles));
+                    _logger.LogInformation("FilePath recebido: {OriginalPath}, FilePath mapeado: {MappedPath}, Exists: {Exists}", videoMessage.FilePath, mappedFilePath, File.Exists(mappedFilePath));
 
-                    // Atualizar status para "Processando"
+                    if (!File.Exists(mappedFilePath)) {
+                        _logger.LogWarning("Arquivo de vídeo não encontrado: {MappedFilePath}", mappedFilePath);
+
+                        using (var scope = _scopeFactory.CreateScope()) {
+                            var dbContext = scope.ServiceProvider.GetRequiredService<VideoDbContext>();
+                            var video = await dbContext.Videos.FindAsync(videoMessage.VideoId);
+                            if (video != null) {
+                                video.Status = "Erro";
+                                await dbContext.SaveChangesAsync(stoppingToken);
+                            }
+                        }
+                        
+                        _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: false);
+                        return;
+                    }
+
+                    IMediaInfo mediaInfo = await FFmpeg.GetMediaInfo(mappedFilePath);
+
                     using (var scope = _scopeFactory.CreateScope()) {
                         var dbContext = scope.ServiceProvider.GetRequiredService<VideoDbContext>();
-                        var video = await dbContext.Videos.FindAsync(videoMessage.VideoId, stoppingToken);
+                        var video = await dbContext.Videos
+                            .Include(v => v.QRCodes)
+                            .FirstOrDefaultAsync(v => v.Id == videoMessage.VideoId, stoppingToken);
+
                         if (video == null) {
                             _logger.LogWarning("Vídeo ID {VideoId} não encontrado no banco", videoMessage.VideoId);
                             _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: false);
@@ -85,78 +124,85 @@ namespace ScanForge.Services {
                         }
 
                         video.Status = "Processando";
+                        video.Duration = (int)mediaInfo.Duration.TotalSeconds;
                         await dbContext.SaveChangesAsync(stoppingToken);
-                        _logger.LogInformation("Vídeo ID {VideoId} atualizado para status 'Processando'", videoMessage.VideoId);
+                        _logger.LogInformation("Vídeo ID {VideoId} atualizado para status 'Processando' com duração {Duration}s", videoMessage.VideoId, video.Duration);
                     }
 
-                    // Verificar se o arquivo de vídeo existe
-                    if (!File.Exists(mappedFilePath)) {
-                        _logger.LogWarning("Arquivo de vídeo não encontrado: {MappedFilePath}", mappedFilePath);
-                        using (var scope = _scopeFactory.CreateScope()) {
-                            var dbContext = scope.ServiceProvider.GetRequiredService<VideoDbContext>();
-                            var video = await dbContext.Videos.FindAsync(videoMessage.VideoId, stoppingToken);
-                            if (video != null) {
-                                video.Status = "Falha";
-                                video.Description = $"Arquivo de vídeo não encontrado: {mappedFilePath}";
-                                await dbContext.SaveChangesAsync(stoppingToken);
-                                _logger.LogInformation("Vídeo ID {VideoId} atualizado para status 'Falha' devido a arquivo ausente", videoMessage.VideoId);
-                            }
-                        }
-                        _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: false);
-                        return;
-                    }
-
-                    // Criar diretório temporário para frames
-                    var tempFramesDir = Path.Combine(Path.GetTempPath(), $"frames_{videoMessage.VideoId}_{Guid.NewGuid()}");
+                    var tempFramesDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
                     Directory.CreateDirectory(tempFramesDir);
+                    var frameOutputPattern = Path.Combine(tempFramesDir, "frame-%03d.png").Replace("/", "\\");
 
                     try {
-                        // Configurar FFmpeg
-                        FFmpeg.SetExecutablesPath(Environment.OSVersion.Platform == PlatformID.Win32NT ? @"C:\ffmpeg\bin" : "/usr/bin");
-                        var frameOutputPattern = Path.Combine(tempFramesDir, "frame-%03d.png").Replace("\\", "/");
+                        _logger.LogInformation("Iniciando extração de frames para {FilePath} com padrão {FrameOutputPattern}", mappedFilePath, frameOutputPattern);
 
-                        // Extrair 1 frame por segundo
                         var conversion = FFmpeg.Conversions.New()
-                            .AddParameter($"-i \"{mappedFilePath}\" -vf fps=1 -c:v png \"{frameOutputPattern}\"");
+                            .AddParameter($"-i \"{mappedFilePath}\" -vf fps=1 \"{frameOutputPattern}\"");
+                        _logger.LogInformation("Comando FFmpeg gerado: {Command}", conversion.Build());
                         await conversion.Start(stoppingToken);
 
-                        _logger.LogInformation("Frames extraídos com sucesso para o vídeo ID {VideoId} em {TempFramesDir}", videoMessage.VideoId, tempFramesDir);
+                        _logger.LogInformation("Frames extraídos para {TempFramesDir}", tempFramesDir);
 
-                        // Aqui você pode adicionar a lógica para escanear QR Codes nos frames (com ZXing.Net)
-                        // Por enquanto, atualizamos o status para "Concluído" como placeholder
+                        var frameFiles = Directory.GetFiles(tempFramesDir, "*.png")
+                            .OrderBy(f => int.Parse(Path.GetFileNameWithoutExtension(f).Split('-')[1]))
+                            .ToArray();
+
+                        var qrResults = new ConcurrentBag<QRCodeResult>();
+
+                        Parallel.ForEach(frameFiles, frameFile => {
+                            try {
+                                int frameNum = int.Parse(Path.GetFileNameWithoutExtension(frameFile).Split('-')[1]);
+                                int timestamp = frameNum - 1;
+
+                                using (var bitmap = (Bitmap)Image.FromFile(frameFile)) {
+                                    var reader = new BarcodeReaderGeneric();
+                                    var source = new BitmapLuminanceSource(bitmap);
+                                    var result = reader.Decode(source);
+
+                                    if (result != null) {
+                                        qrResults.Add(new QRCodeResult { Content = result.Text, Timestamp = timestamp });
+                                        _logger.LogInformation("QR Code encontrado no frame {FrameFile}: {QrCodeText} no timestamp {Timestamp}s", frameFile, result.Text, timestamp);
+                                    }
+                                }
+                            } catch (Exception ex) {
+                                _logger.LogWarning(ex, "Erro ao escanear QR Code no frame {FrameFile}", frameFile);
+                            }
+                        });
+
                         using (var scope = _scopeFactory.CreateScope()) {
                             var dbContext = scope.ServiceProvider.GetRequiredService<VideoDbContext>();
-                            var video = await dbContext.Videos.FindAsync(videoMessage.VideoId, stoppingToken);
+                            var video = await dbContext.Videos
+                                .Include(v => v.QRCodes)
+                                .FirstOrDefaultAsync(v => v.Id == videoMessage.VideoId, stoppingToken);
+
                             if (video != null) {
+                                foreach (var qr in qrResults) {
+                                    qr.VideoId = video.Id;
+                                    video.QRCodes.Add(qr);
+                                }
                                 video.Status = "Concluído";
-                                video.Description = "Frames extraídos com sucesso";
                                 await dbContext.SaveChangesAsync(stoppingToken);
-                                _logger.LogInformation("Vídeo ID {VideoId} atualizado para status 'Concluído'", videoMessage.VideoId);
+                                _logger.LogInformation("Vídeo ID {VideoId} atualizado para status 'Concluído' com {QrCount} QR Codes salvos", videoMessage.VideoId, qrResults.Count);
                             }
                         }
                     } catch (Exception ex) {
-                        _logger.LogError(ex, "Erro ao processar vídeo ID {VideoId}: {Message}", videoMessage.VideoId, ex.Message);
+                        _logger.LogError(ex, "Erro ao processar vídeo {FilePath}", mappedFilePath);
                         using (var scope = _scopeFactory.CreateScope()) {
                             var dbContext = scope.ServiceProvider.GetRequiredService<VideoDbContext>();
-                            var video = await dbContext.Videos.FindAsync(videoMessage.VideoId, stoppingToken);
+                            var video = await dbContext.Videos.FindAsync(videoMessage.VideoId);
                             if (video != null) {
-                                video.Status = "Falha";
-                                video.Description = $"Erro ao processar vídeo: {ex.Message}";
+                                video.Status = "Erro";
                                 await dbContext.SaveChangesAsync(stoppingToken);
-                                _logger.LogInformation("Vídeo ID {VideoId} atualizado para status 'Falha'", videoMessage.VideoId);
                             }
                         }
                         _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: true);
                         return;
                     } finally {
-                        // Limpar frames temporários
                         if (Directory.Exists(tempFramesDir)) {
                             Directory.Delete(tempFramesDir, true);
-                            _logger.LogInformation("Frames temporários removidos: {TempFramesDir}", tempFramesDir);
                         }
                     }
 
-                    // Confirmar recebimento da mensagem
                     _channel.BasicAck(deliveryTag: ea.DeliveryTag, multiple: false);
                 } catch (Exception ex) {
                     _logger.LogError(ex, "Erro ao processar mensagem na fila {QueueName}", _queueName);
@@ -166,21 +212,15 @@ namespace ScanForge.Services {
 
             _channel.BasicConsume(queue: _queueName, autoAck: false, consumer: consumer);
 
-            while (!stoppingToken.IsCancellationRequested) {
-                await Task.Delay(1000, stoppingToken);
-            }
+            await Task.Delay(Timeout.Infinite, stoppingToken);
         }
 
         public override void Dispose() {
-            try {
-                _channel?.Close();
-                _connection?.Close();
-                _logger.LogInformation("Conexão com RabbitMQ fechada com sucesso");
-            } catch (Exception ex) {
-                _logger.LogError(ex, "Erro ao fechar conexão com RabbitMQ");
-            }
+            _channel?.Close();
+            _connection?.Close();
+            _channel?.Dispose();
+            _connection?.Dispose();
             base.Dispose();
         }
     }
-
 }

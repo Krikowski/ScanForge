@@ -7,5 +7,12 @@ namespace ScanForge.Data {
         }
 
         public DbSet<VideoDB> Videos { get; set; }
+        public DbSet<QRCodeResult> QRCodes { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder) {
+            modelBuilder.Entity<VideoDB>().ToTable("Videos", schema: "public"); // Ajustado para "Videos"
+            modelBuilder.Entity<QRCodeResult>().ToTable("QRCodes", schema: "public");
+            base.OnModelCreating(modelBuilder);
+        }
     }
 }

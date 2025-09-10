@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.11.35303.130
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ScanForge", "ScanForge.csproj", "{92812D72-7A70-409A-8397-CE86AFA86CB2}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ScanForge", "ScanForge.csproj", "{8EC79AC1-4BCF-4ABD-B359-60DDD59B0A03}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -11,15 +11,15 @@ Global
 		Release|Any CPU = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{92812D72-7A70-409A-8397-CE86AFA86CB2}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{92812D72-7A70-409A-8397-CE86AFA86CB2}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{92812D72-7A70-409A-8397-CE86AFA86CB2}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{92812D72-7A70-409A-8397-CE86AFA86CB2}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8EC79AC1-4BCF-4ABD-B359-60DDD59B0A03}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8EC79AC1-4BCF-4ABD-B359-60DDD59B0A03}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8EC79AC1-4BCF-4ABD-B359-60DDD59B0A03}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8EC79AC1-4BCF-4ABD-B359-60DDD59B0A03}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
-		SolutionGuid = {55270C41-3D19-49CB-82DA-B0D8F666DE60}
+		SolutionGuid = {20AAF752-ADEE-420E-8DBA-092FBE3FE76D}
 	EndGlobalSection
 EndGlobal
