@@ -16,11 +16,15 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Threading;
+using System.Diagnostics;
+using MongoDB.Driver;
 
 namespace ScanForge.Services {
     public class RabbitMqConsumerService : BackgroundService {
         private readonly ILogger<RabbitMqConsumerService> _logger;
         private readonly IServiceScopeFactory _scopeFactory;
+        private readonly IMongoDatabase _mongoDatabase;
+        private readonly IConfiguration _configuration;
         private IConnection _connection;
         private IModel _channel;
         private readonly string _queueName;
@@ -28,11 +32,14 @@ namespace ScanForge.Services {
         private readonly string _ffmpegPath;
         private readonly ConnectionFactory _factory;
 
-        public RabbitMqConsumerService(ILogger<RabbitMqConsumerService> logger, IServiceScopeFactory scopeFactory, IConfiguration configuration) {
+        public RabbitMqConsumerService(ILogger<RabbitMqConsumerService> logger, IServiceScopeFactory scopeFactory,
+            IMongoDatabase mongoDatabase, IConfiguration configuration) {
             _logger = logger;
             _scopeFactory = scopeFactory;
+            _mongoDatabase = mongoDatabase;
+            _configuration = configuration;
             _queueName = configuration["RabbitMQ:QueueName"] ?? "video_queue";
-            _videoBasePath = configuration["VideoStorage:BasePath"] ?? "C:\\videos";
+            _videoBasePath = configuration["VideoStorage:BasePath"] ?? "C:\\Estudos\\Hackaton_FIAP\\uploads";
             _ffmpegPath = configuration["FFmpeg:Path"] ?? "C:\\ffmpeg\\bin";
 
             _factory = new ConnectionFactory {
@@ -82,9 +89,8 @@ namespace ScanForge.Services {
                     var message = Encoding.UTF8.GetString(body);
                     var videoMessage = JsonConvert.DeserializeObject<VideoMessage>(message);
 
-                    // Usar o FilePath diretamente, garantindo compatibilidade com Windows
                     var mappedFilePath = videoMessage.FilePath;
-                    if (mappedFilePath.StartsWith("/app/videos")) {
+                    if (mappedFilePath.StartsWith("/uploads")) {
                         var fileName = Path.GetFileName(videoMessage.FilePath);
                         mappedFilePath = Path.Combine(_videoBasePath, fileName).Replace("/", "\\").Trim();
                     } else {
@@ -94,40 +100,15 @@ namespace ScanForge.Services {
                     _logger.LogInformation("FilePath recebido: {OriginalPath}, FilePath mapeado: {MappedPath}, Exists: {Exists}", videoMessage.FilePath, mappedFilePath, File.Exists(mappedFilePath));
 
                     if (!File.Exists(mappedFilePath)) {
-                        _logger.LogWarning("Arquivo de vídeo não encontrado: {MappedFilePath}", mappedFilePath);
-
-                        using (var scope = _scopeFactory.CreateScope()) {
-                            var dbContext = scope.ServiceProvider.GetRequiredService<VideoDbContext>();
-                            var video = await dbContext.Videos.FindAsync(videoMessage.VideoId);
-                            if (video != null) {
-                                video.Status = "Erro";
-                                await dbContext.SaveChangesAsync(stoppingToken);
-                            }
-                        }
-                        
+                        await UpdateVideoStatusInMongoAsync(videoMessage.VideoId, "Erro");
                         _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: false);
                         return;
                     }
 
                     IMediaInfo mediaInfo = await FFmpeg.GetMediaInfo(mappedFilePath);
+                    int duration = (int)mediaInfo.Duration.TotalSeconds;
 
-                    using (var scope = _scopeFactory.CreateScope()) {
-                        var dbContext = scope.ServiceProvider.GetRequiredService<VideoDbContext>();
-                        var video = await dbContext.Videos
-                            .Include(v => v.QRCodes)
-                            .FirstOrDefaultAsync(v => v.Id == videoMessage.VideoId, stoppingToken);
-
-                        if (video == null) {
-                            _logger.LogWarning("Vídeo ID {VideoId} não encontrado no banco", videoMessage.VideoId);
-                            _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: false);
-                            return;
-                        }
-
-                        video.Status = "Processando";
-                        video.Duration = (int)mediaInfo.Duration.TotalSeconds;
-                        await dbContext.SaveChangesAsync(stoppingToken);
-                        _logger.LogInformation("Vídeo ID {VideoId} atualizado para status 'Processando' com duração {Duration}s", videoMessage.VideoId, video.Duration);
-                    }
+                    await UpdateVideoStatusInMongoAsync(videoMessage.VideoId, "Processando", duration);
 
                     var tempFramesDir = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
                     Directory.CreateDirectory(tempFramesDir);
@@ -136,8 +117,13 @@ namespace ScanForge.Services {
                     try {
                         _logger.LogInformation("Iniciando extração de frames para {FilePath} com padrão {FrameOutputPattern}", mappedFilePath, frameOutputPattern);
 
+                        double fps = duration > _configuration.GetValue<int>("Optimization:DurationThreshold", 120)
+                            ? _configuration.GetValue<double>("Optimization:OptimizedFps", 0.5)
+                            : _configuration.GetValue<double>("Optimization:DefaultFps", 1.0);
+                        _logger.LogInformation("Duração {Duration}s - Usando FPS otimizado: {Fps}", duration, fps);
+
                         var conversion = FFmpeg.Conversions.New()
-                            .AddParameter($"-i \"{mappedFilePath}\" -vf fps=1 \"{frameOutputPattern}\"");
+                            .AddParameter($"-i \"{mappedFilePath}\" -vf fps={fps} \"{frameOutputPattern}\"");
                         _logger.LogInformation("Comando FFmpeg gerado: {Command}", conversion.Build());
                         await conversion.Start(stoppingToken);
 
@@ -149,10 +135,13 @@ namespace ScanForge.Services {
 
                         var qrResults = new ConcurrentBag<QRCodeResult>();
 
-                        Parallel.ForEach(frameFiles, frameFile => {
+                        var stopwatch = Stopwatch.StartNew();
+
+                        var parallelOptions = new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount };
+                        Parallel.ForEach(frameFiles, parallelOptions, frameFile => {
                             try {
                                 int frameNum = int.Parse(Path.GetFileNameWithoutExtension(frameFile).Split('-')[1]);
-                                int timestamp = frameNum - 1;
+                                int timestamp = (int)((frameNum - 1) / fps);  
 
                                 using (var bitmap = (Bitmap)Image.FromFile(frameFile)) {
                                     var reader = new BarcodeReaderGeneric();
@@ -169,32 +158,20 @@ namespace ScanForge.Services {
                             }
                         });
 
-                        using (var scope = _scopeFactory.CreateScope()) {
-                            var dbContext = scope.ServiceProvider.GetRequiredService<VideoDbContext>();
-                            var video = await dbContext.Videos
-                                .Include(v => v.QRCodes)
-                                .FirstOrDefaultAsync(v => v.Id == videoMessage.VideoId, stoppingToken);
+                        stopwatch.Stop();
+                        _logger.LogInformation("Processamento paralelo de {FrameCount} frames concluído em {ElapsedMs}ms", frameFiles.Length, stopwatch.ElapsedMilliseconds);
 
-                            if (video != null) {
-                                foreach (var qr in qrResults) {
-                                    qr.VideoId = video.Id;
-                                    video.QRCodes.Add(qr);
-                                }
-                                video.Status = "Concluído";
-                                await dbContext.SaveChangesAsync(stoppingToken);
-                                _logger.LogInformation("Vídeo ID {VideoId} atualizado para status 'Concluído' com {QrCount} QR Codes salvos", videoMessage.VideoId, qrResults.Count);
-                            }
-                        }
+                        var collection = _mongoDatabase.GetCollection<VideoResult>("VideoResults");
+                        var filter = Builders<VideoResult>.Filter.Eq(v => v.VideoId, videoMessage.VideoId);
+                        var update = Builders<VideoResult>.Update
+                            .Set(v => v.QRCodes, qrResults.ToList())
+                            .Set(v => v.Status, "Concluído");
+                        await collection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true });
+                        _logger.LogInformation("Vídeo ID {VideoId} atualizado em Mongo para 'Concluído' com {QrCount} QR Codes", videoMessage.VideoId, qrResults.Count);
+
                     } catch (Exception ex) {
                         _logger.LogError(ex, "Erro ao processar vídeo {FilePath}", mappedFilePath);
-                        using (var scope = _scopeFactory.CreateScope()) {
-                            var dbContext = scope.ServiceProvider.GetRequiredService<VideoDbContext>();
-                            var video = await dbContext.Videos.FindAsync(videoMessage.VideoId);
-                            if (video != null) {
-                                video.Status = "Erro";
-                                await dbContext.SaveChangesAsync(stoppingToken);
-                            }
-                        }
+                        await UpdateVideoStatusInMongoAsync(videoMessage.VideoId, "Erro");
                         _channel.BasicNack(deliveryTag: ea.DeliveryTag, multiple: false, requeue: true);
                         return;
                     } finally {
@@ -213,6 +190,17 @@ namespace ScanForge.Services {
             _channel.BasicConsume(queue: _queueName, autoAck: false, consumer: consumer);
 
             await Task.Delay(Timeout.Infinite, stoppingToken);
+        }
+
+        private async Task UpdateVideoStatusInMongoAsync(int videoId, string status, int duration = 0) {
+            var collection = _mongoDatabase.GetCollection<VideoResult>("VideoResults");
+            var filter = Builders<VideoResult>.Filter.Eq(v => v.VideoId, videoId);
+            var update = Builders<VideoResult>.Update.Set(v => v.Status, status);
+            if (duration > 0) {
+                update = update.Set("Duration", duration);
+            }
+            await collection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true });
+            _logger.LogInformation("Status atualizado em Mongo para {Status} no vídeo ID {VideoId}", status, videoId);
         }
 
         public override void Dispose() {
