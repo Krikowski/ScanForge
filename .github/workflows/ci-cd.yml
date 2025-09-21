@@ -1,0 +1,29 @@
+name: CI/CD
+
+on: [push]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - uses: actions/setup-dotnet@v3
+      with: { dotnet-version: '8.0.x' }
+    - run: dotnet restore
+    - run: dotnet build
+    - run: dotnet test --no-build --verbosity normal --collect:"XPlat Code Coverage"
+  
+  docker-push:
+    runs-on: ubuntu-latest
+    needs: build-test
+    steps:
+    - uses: actions/checkout@v3
+    - name: Build and push
+      uses: docker/build-push-action@v4
+      with:
+        context: .
+        push: true
+        tags: usuario/scanforge:latest
+      env:
+        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
