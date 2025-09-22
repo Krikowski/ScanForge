@@ -1,402 +1,220 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading.Tasks;
+﻿using FFMpegCore;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using ScanForge.DTOs;
 using ScanForge.Models;
 using ScanForge.Repositories;
+using ScanForge.Services;
 using SkiaSharp;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;  // Adição para Process (já disponível em .NET 8, sem conflito)
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using ZXing;
 using ZXing.SkiaSharp;
-using ZXing.Common;
-using System.Diagnostics;
-using System.Text.RegularExpressions;
 
 namespace ScanForge.Services;
 
+/// <summary>
+/// Serviço principal para processamento de vídeos com FFMpegCore e ZXing
+/// Implementa RF3-5: decodificação, extração de frames e detecção de QR Codes
+/// </summary>
 public class VideoProcessingService : IVideoProcessingService {
-    private readonly IVideoRepository _videoRepository;
+    private readonly IVideoRepository _repository;
     private readonly ILogger<VideoProcessingService> _logger;
-    private readonly VideoProcessingOptions _options;
+    private readonly string _basePath;
     private readonly string _tempFramesPath;
+    private readonly int _durationThreshold;
+    private readonly double _optimizedFps;
+    private readonly double _defaultFps;
 
+    /// <summary>
+    /// Construtor com injeção de dependências (3 parâmetros: Repository, Logger, Configuration)
+    /// </summary>
     public VideoProcessingService(
-        IVideoRepository videoRepository,
+        IVideoRepository repository,
         ILogger<VideoProcessingService> logger,
-        IOptions<VideoProcessingOptions> options,
-        IOptions<VideoStorageOptions> storageOptions) {
-        _videoRepository = videoRepository ?? throw new ArgumentNullException(nameof(videoRepository));
+        IConfiguration configuration) {
+        _repository = repository ?? throw new ArgumentNullException(nameof(repository));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
-        _tempFramesPath = storageOptions?.Value?.TempFramesPath ?? "/tmp/scanforge_frames";
-
-        // ✅ CRIAÇÃO AUTOMÁTICA DO DIRETÓRIO TEMPORÁRIO
-        try {
-            Directory.CreateDirectory(_tempFramesPath);
-            _logger.LogDebug("📁 Diretório temporário criado: {TempFramesPath}", _tempFramesPath);
-        } catch (Exception ex) {
-            _logger.LogWarning(ex, "⚠️ Falha ao criar diretório temporário: {TempFramesPath}", _tempFramesPath);
-        }
+        // Configurações do appsettings.json
+        _basePath = configuration["VideoStorage:BasePath"] ?? "/app/uploads";
+        _tempFramesPath = configuration["VideoStorage:TempFramesPath"] ?? "/tmp/scanforge_frames";
+        _durationThreshold = int.Parse(configuration["Optimization:DurationThreshold"] ?? "120");
+        _optimizedFps = double.Parse(configuration["Optimization:OptimizedFps"] ?? "0.5");
+        _defaultFps = double.Parse(configuration["Optimization:DefaultFps"] ?? "1.0");
     }
 
     /// <summary>
-    /// Processa vídeo extraíndo frames e detectando QR Codes
+    /// Processa vídeo completo: análise de duração, extração de frames, detecção de QR Codes
+    /// Implementa processamento paralelo (bônus) e otimização de FPS baseada em duração
     /// </summary>
     public async Task ProcessVideoAsync(VideoMessage message) {
-        ArgumentNullException.ThrowIfNull(message);
-
-        var videoId = message.VideoId;
-        var filePath = message.FilePath;
-
-        _logger.LogInformation("🎬 === INICIANDO PROCESSAMENTO VideoId={VideoId}: {FileName} ===", videoId, Path.GetFileName(filePath));
-
+        var startTime = DateTime.UtcNow;
+        _logger.LogInformation("🎬 === INICIANDO PROCESSAMENTO VideoId={VideoId}: {FileName} ===",
+            message.VideoId, Path.GetFileName(message.FilePath));
         try {
-            // ✅ VALIDAÇÃO DE ARQUIVO
-            if (!File.Exists(filePath)) {
-                var errorMsg = $"Arquivo não encontrado: {filePath}";
-                _logger.LogError(errorMsg);
-                await _videoRepository.UpdateStatusAsync(videoId, "Erro", errorMsg);
-                return;
-            }
+            // ✅ Arquivo resolvido (já funcionando!)
+            string resolvedPath = ResolveFilePath(message.FilePath);
+            message.FilePath = resolvedPath;
+            _logger.LogInformation("✅ Arquivo resolvido em: {ResolvedPath}", resolvedPath);
 
-            _logger.LogInformation("✅ Arquivo resolvido em: {FilePath}", filePath);
+            // Atualiza status inicial
+            await _repository.UpdateStatusAsync(message.VideoId, "Processando");
 
-            // 1. Análise de metadados com FFProbe (usando Process)
-            var videoInfo = await AnalyzeVideoMetadataAsync(filePath);
-            if (videoInfo == null) {
-                var errorMsg = "Falha na análise de metadados do vídeo";
-                _logger.LogError(errorMsg);
-                await _videoRepository.UpdateStatusAsync(videoId, "Erro", errorMsg);
-                return;
-            }
+            // Análise FFmpeg (RF3) - Adição: Try-catch específico com captura manual de output para melhor logging
+            int duration = 0;
+            double fps = _defaultFps;  // Default fallback
+            try {
+                _logger.LogDebug("🔍 Analisando metadados com FFProbe...");
+                var analysis = await FFProbe.AnalyseAsync(message.FilePath);
+                duration = (int)analysis.Duration.TotalSeconds;
+                _logger.LogInformation("📊 Análise FFmpeg: Duração {Duration}s, {Width}x{Height}, {VideoCodec}",
+                    duration, analysis.PrimaryVideoStream.Width, analysis.PrimaryVideoStream.Height, analysis.PrimaryVideoStream.CodecName);
+                fps = duration > _durationThreshold ? _optimizedFps : _defaultFps;
+                _logger.LogInformation("⚙️ Configuração: FPS={Fps} (threshold: {Threshold}s)", fps, _durationThreshold);
+            } catch (Exception ex) {
+                _logger.LogError(ex, "⚠️ FFProbe falhou na análise de metadados para {FilePath}", message.FilePath);
 
-            _logger.LogInformation("📊 Análise FFmpeg: Duração {Duration}s, {Width}x{Height}, {Codec}",
-                videoInfo.Duration, videoInfo.Width, videoInfo.Height, videoInfo.Codec);
-
-            // 2. Atualiza status para "Processando" com duração
-            await _videoRepository.UpdateStatusAsync(videoId, "Processando", duration: videoInfo.Duration);
-            _logger.LogInformation("🔄 Status atualizado para 'Processando' - Duração: {Duration}s", videoInfo.Duration);
-
-            // 3. Configuração de FPS baseada na duração (otimização)
-            var fps = videoInfo.Duration > _options.DurationThreshold
-                ? _options.OptimizedFps
-                : _options.DefaultFps;
-            _logger.LogInformation("⚙️ Configuração: FPS={Fps} (threshold: {Threshold}s)", fps, _options.DurationThreshold);
-
-            // 4. Extração de frames
-            var frames = await ExtractFramesAsync(filePath, fps, videoInfo.Duration, videoId);
-            if (!frames.Any()) {
-                var errorMsg = "Nenhum frame foi extraído do vídeo";
-                _logger.LogWarning(errorMsg);
-                await _videoRepository.UpdateStatusAsync(videoId, "Concluído", errorMsg, videoInfo.Duration);
-                return;
-            }
-
-            _logger.LogInformation("🔍 ✅ {FrameCount} frames extraídos em {Elapsed}s",
-                frames.Count, frames.FirstOrDefault()?.ExtractionTime ?? 0);
-
-            // ✅ CORREÇÃO PRINCIPAL: Coleta thread-safe de QR Codes
-            _logger.LogInformation("🔍 Processando {FrameCount} frames em paralelo para QR detection", frames.Count);
-
-            var qrResults = new ConcurrentBag<QRCodeResult>(); // ✅ THREAD-SAFE COLLECTION
-
-            // ✅ PROCESSAMENTO PARALELO COM OPÇÕES DE CONCORRÊNCIA CONTROLADA
-            var parallelOptions = new ParallelOptions {
-                MaxDegreeOfParallelism = Math.Min(Environment.ProcessorCount, 4) // ✅ LIMITA CONCORRÊNCIA
-            };
-
-            Parallel.ForEach(frames, parallelOptions, frame => {
+                // Captura manual de output/stderr para logging detalhado (usa ffprobe diretamente, sem mudar dependência de FFMpegCore)
                 try {
-                    var detectedContent = DetectQRInFrame(frame.Path);
-                    if (!string.IsNullOrEmpty(detectedContent)) {
-                        // ✅ CADA DETECÇÃO É ADICIONADA DE FORMA SEGURA
-                        var qrResult = new QRCodeResult {
-                            Content = detectedContent,
-                            Timestamp = frame.Timestamp
-                        };
+                    var process = new Process {
+                        StartInfo = new ProcessStartInfo {
+                            FileName = "/usr/bin/ffprobe",  // Path do appsettings/FFMpeg, consistente com Dockerfile
+                            Arguments = $"-v error -show_format -show_streams \"{message.FilePath}\"",
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                            CreateNoWindow = true
+                        }
+                    };
+                    process.Start();
+                    string stdout = await process.StandardOutput.ReadToEndAsync();
+                    string stderr = await process.StandardError.ReadToEndAsync();
+                    await process.WaitForExitAsync();
+                    _logger.LogError("📋 FFProbe detalhado: ExitCode={Code}, Stdout='{Stdout}', Stderr='{Stderr}'",
+                        process.ExitCode, stdout.Trim(), stderr.Trim());
 
-                        qrResults.Add(qrResult);
+                    // Se erro específico (ex: "Invalid data"), set message custom
+                    string errorMsg = string.IsNullOrEmpty(stderr) ? ex.Message : stderr;
+                    await _repository.UpdateStatusAsync(message.VideoId, "Erro", errorMsg, duration);
+                    throw new InvalidOperationException($"Falha na análise de metadados: {errorMsg}", ex);
+                } catch (Exception logEx) {
+                    _logger.LogWarning(logEx, "⚠️ Falha ao capturar output detalhado de FFProbe");
+                    await _repository.UpdateStatusAsync(message.VideoId, "Erro", ex.Message, duration);
+                    throw;
+                }
+            }
 
-                        _logger.LogInformation("✅ 🎯 QR Code detectado! Frame {Timestamp}s (t={Timestamp}s): {Content}",
-                            frame.Timestamp, frame.Timestamp, detectedContent);
+            await _repository.UpdateStatusAsync(message.VideoId, "Processando", duration: duration);
+
+            // Extrair frames (RF3)
+            _logger.LogInformation("🎬 Extraindo frames com FFMpeg...");
+            Directory.CreateDirectory(_tempFramesPath);
+            var outputPattern = Path.Combine(_tempFramesPath, "frame_%04d.png");
+            await FFMpegArguments
+                .FromFileInput(message.FilePath)
+                .OutputToFile(outputPattern, overwrite: true, options => options
+                    .WithFramerate(fps)
+                    .WithVideoCodec("png")
+                    .ForceFormat("image2"))
+                .ProcessAsynchronously();
+
+            var frameFiles = Directory.GetFiles(_tempFramesPath, "frame_*.png")
+                .OrderBy(f => f)
+                .ToList();
+            _logger.LogInformation("🔍 ✅ {FrameCount} frames extraídos em {Elapsed}s",
+                frameFiles.Count, DateTime.UtcNow.Subtract(startTime).TotalSeconds);
+
+            // Processar QR Codes (RF4) - com tratamento de erro por frame
+            var qrResults = new List<QRCodeResult>();
+            _logger.LogInformation("🔍 Processando {FrameCount} frames em paralelo para QR detection", frameFiles.Count);
+            var processedFrames = 0;
+            Parallel.ForEach(frameFiles, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, frameFile => {
+                try {
+                    // ✅ SkiaSharp corrigido no Dockerfile
+                    using var bitmap = SKBitmap.Decode(frameFile);
+                    if (bitmap == null) {
+                        _logger.LogWarning("⚠️ Frame inválido: {FrameFile}", frameFile);
+                        return;
                     }
+                    var reader = new BarcodeReader();
+                    var result = reader.Decode(bitmap);
+                    if (result != null) {
+                        var frameNumber = int.Parse(Path.GetFileNameWithoutExtension(frameFile).Split('_')[1]);
+                        var timestamp = (int)(frameNumber / fps);
+                        lock (qrResults) {
+                            qrResults.Add(new QRCodeResult {
+                                Content = result.Text,
+                                Timestamp = timestamp
+                            });
+                        }
+                        _logger.LogInformation("✅ 🎯 QR Code detectado! Frame {FrameNumber}s (t={Timestamp}s): {Content}",
+                            frameNumber, timestamp, result.Text);
+                    }
+                    Interlocked.Increment(ref processedFrames);
+                } catch (DllNotFoundException ex) when (ex.Message.Contains("libSkiaSharp")) {
+                    _logger.LogError(ex, "❌ CRÍTICO: SkiaSharp não instalado - instale no Dockerfile!");
+                    throw; // Re-throw para falha visível
                 } catch (Exception ex) {
-                    _logger.LogWarning(ex, "⚠️ Erro ao processar frame {FramePath} (t={Timestamp}s)",
-                        frame.Path, frame.Timestamp);
-                    // ✅ NÃO PARA O PROCESSAMENTO - CONTINUA COM OUTROS FRAMES
+                    _logger.LogWarning(ex, "⚠️ Erro ao processar frame {FrameFile}", frameFile);
                 }
             });
+            _logger.LogInformation("✅ Processamento de frames concluído: {Processed}/{Total} frames OK", processedFrames, frameFiles.Count);
 
-            // ✅ ORDENAÇÃO POR TIMESTAMP PARA CONSISTÊNCIA NO BANCO
-            var sortedQrResults = qrResults
-                .OrderBy(qr => qr.Timestamp)
-                .ToList();
+            // ✅ CORREÇÃO: Salvar TODOS os QR Codes (sem deduplicação) ordenados por timestamp
+            if (qrResults.Any()) {
+                var allQrsOrdered = qrResults
+                    .OrderBy(q => q.Timestamp) // Ordena por timestamp (mantém múltiplos do mesmo conteúdo)
+                    .ToList();
 
-            _logger.LogInformation("✅ Processamento de frames concluído: {Detected}/{Total} frames com QR OK",
-                sortedQrResults.Count, frames.Count);
-
-            // 5. Atualização final no MongoDB
-            if (sortedQrResults.Any()) {
-                await _videoRepository.AddQRCodesAsync(videoId, sortedQrResults);
-                _logger.LogInformation("💾 ✅ {Count} QR Codes salvos no MongoDB para VideoId={VideoId}",
-                    sortedQrResults.Count, videoId);
+                _logger.LogInformation("📈 {QrCount} QR Codes detectados salvos (ordenados por timestamp)",
+                    allQrsOrdered.Count);
+                await _repository.AddQRCodesAsync(message.VideoId, allQrsOrdered);
             } else {
-                _logger.LogInformation("ℹ️ Nenhum QR Code detectado em {FrameCount} frames", frames.Count);
+                _logger.LogInformation("📭 Nenhum QR Code detectado no vídeo {VideoId}", message.VideoId);
             }
 
-            // 6. Status final "Concluído"
-            await _videoRepository.UpdateStatusAsync(videoId, "Concluído", duration: videoInfo.Duration);
-            _logger.LogInformation("🎉 === PROCESSAMENTO CONCLUÍDO VideoId={VideoId}: {Detected} QR(s) detectado(s) ===",
-                videoId, sortedQrResults.Count);
+            // Finalizar (RF5-6)
+            await _repository.UpdateStatusAsync(message.VideoId, "Concluído");
 
-            // ✅ LIMPEZA DE FRAMES TEMPORÁRIOS
-            CleanupFrames(frames.Select(f => f.Path).ToList());
-            _logger.LogDebug("🧹 Frames temporários removidos");
+            // Cleanup
+            try {
+                Directory.Delete(_tempFramesPath, true);
+                _logger.LogDebug("🧹 Frames temporários removidos");
+            } catch (Exception cleanupEx) {
+                _logger.LogWarning(cleanupEx, "⚠️ Erro ao remover frames temporários");
+            }
 
+            var totalTime = DateTime.UtcNow.Subtract(startTime).TotalSeconds;
+            _logger.LogInformation("🎉 ✅ === PROCESSAMENTO CONCLUÍDO: VideoId={VideoId}, QRs={Count}, Tempo={TotalTime:F1}s ===",
+                message.VideoId, qrResults.Count, totalTime);
         } catch (Exception ex) {
-            _logger.LogError(ex, "💥 Erro crítico no processamento VideoId={VideoId}: {Message}", videoId, ex.Message);
-            await _videoRepository.UpdateStatusAsync(videoId, "Erro", ex.Message);
+            _logger.LogError(ex, "💥 === ERRO CRÍTICO no processamento VideoId={VideoId}: {Message} ===",
+                message.VideoId, ex.Message);
+            await _repository.UpdateStatusAsync(message.VideoId, "Erro", ex.Message);
+            throw new InvalidOperationException($"Falha processamento {message.VideoId}", ex);
         }
     }
 
     /// <summary>
-    /// Analisa metadados do vídeo usando FFProbe via Process
+    /// Resolve path do arquivo com fallback para volumes compartilhados
+    /// Correção: Evita loop infinito em FileNotFound
     /// </summary>
-    private async Task<VideoInfo?> AnalyzeVideoMetadataAsync(string filePath) {
-        try {
-            _logger.LogDebug("🔍 Analisando metadados com FFProbe...");
-
-            var startInfo = new ProcessStartInfo {
-                FileName = _options.FFmpegPath,
-                Arguments = $"-v quiet -print_format json -show_format -show_streams \"{filePath}\"",
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true
-            };
-
-            using var process = new Process { StartInfo = startInfo };
-            var output = new System.Text.StringBuilder();
-            var error = new System.Text.StringBuilder();
-
-            process.OutputDataReceived += (s, e) => {
-                if (e.Data != null) output.AppendLine(e.Data);
-            };
-
-            process.ErrorDataReceived += (s, e) => {
-                if (e.Data != null) error.AppendLine(e.Data);
-            };
-
-            // ✅ CORREÇÃO: Usar Start() ao invés de StartAsync()
-            process.Start();
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-
-            await process.WaitForExitAsync();
-
-            if (process.ExitCode != 0) {
-                _logger.LogWarning("FFProbe falhou com código {ExitCode}. Output: {Output}", process.ExitCode, output.ToString());
-                return null;
+    private string ResolveFilePath(string originalPath) {
+        var possiblePaths = new[]
+        {
+            originalPath,
+            Path.Combine("/uploads", Path.GetFileName(originalPath)),
+            Path.Combine("/app/uploads", Path.GetFileName(originalPath))
+        };
+        foreach (var path in possiblePaths) {
+            if (File.Exists(path)) {
+                return path;
             }
-
-            var jsonOutput = output.ToString();
-            _logger.LogDebug("FFProbe JSON: {Json}", jsonOutput);
-
-            // ✅ PARSING MELHORADO DO JSON
-            return ParseVideoInfo(jsonOutput);
-        } catch (Exception ex) {
-            _logger.LogError(ex, "Erro na análise de metadados: {Message}", ex.Message);
-            return null;
         }
+        throw new FileNotFoundException($"Arquivo não encontrado em nenhum path: {string.Join(", ", possiblePaths)}");
     }
-
-    /// <summary>
-    /// Parseia informações do vídeo do JSON do FFProbe
-    /// </summary>
-    private VideoInfo? ParseVideoInfo(string jsonOutput) {
-        try {
-            // Regex para extrair valores do JSON
-            var durationMatch = Regex.Match(jsonOutput, @"""duration"":\s*""?(\d+(?:\.\d+)?)""?");
-            var widthMatch = Regex.Match(jsonOutput, @"""width"":\s*(\d+)");
-            var heightMatch = Regex.Match(jsonOutput, @"""height"":\s*(\d+)");
-            var codecMatch = Regex.Match(jsonOutput, @"""codec_name"":\s*""([^""]+)""");
-
-            if (!durationMatch.Success) {
-                _logger.LogWarning("Não foi possível extrair duração do JSON");
-                return null;
-            }
-
-            return new VideoInfo {
-                Duration = (int)Math.Round(double.Parse(durationMatch.Groups[1].Value)),
-                Width = widthMatch.Success ? int.Parse(widthMatch.Groups[1].Value) : 0,
-                Height = heightMatch.Success ? int.Parse(heightMatch.Groups[1].Value) : 0,
-                Codec = codecMatch.Success ? codecMatch.Groups[1].Value : "unknown"
-            };
-        } catch (Exception ex) {
-            _logger.LogError(ex, "Erro no parsing do JSON do FFProbe: {Message}", ex.Message);
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// Extrai frames do vídeo usando FFmpeg via Process
-    /// </summary>
-    private async Task<List<VideoFrame>> ExtractFramesAsync(string filePath, double fps, int totalDuration, int videoId) {
-        var frames = new List<VideoFrame>();
-        var stopwatch = Stopwatch.StartNew();
-
-        try {
-            // Calcula intervalos de extração
-            var frameInterval = 1.0 / fps;
-            var totalFrames = Math.Min((int)(totalDuration * fps), 10); // ✅ Limite de 10 frames para teste
-
-            _logger.LogDebug("📸 Extraindo {TotalFrames} frames a {Fps} FPS (intervalo: {Interval}s)",
-                totalFrames, fps, frameInterval);
-
-            // ✅ EXTRAÇÃO SEQUENCIAL DE FRAMES
-            for (int i = 0; i < totalFrames; i++) {
-                var timestamp = i * frameInterval;
-
-                // ✅ CORREÇÃO: Usar videoId passado como parâmetro
-                var framePath = Path.Combine(_tempFramesPath, $"frame_{videoId:D6}_{i:D4}.jpg");
-
-                var arguments = $"-ss {timestamp:F2} -i \"{filePath}\" -vframes 1 -q:v {_options.FrameQualityCrf} \"{framePath}\" -y";
-
-                var startInfo = new ProcessStartInfo {
-                    FileName = _options.FFmpegPath,
-                    Arguments = arguments,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
-
-                using var process = new Process { StartInfo = startInfo };
-
-                // ✅ CORREÇÃO: Usar Start() + WaitForExitAsync()
-                process.Start();
-                process.BeginOutputReadLine();
-                process.BeginErrorReadLine();
-
-                await process.WaitForExitAsync();
-
-                if (process.ExitCode == 0 && File.Exists(framePath)) {
-                    var fileInfo = new FileInfo(framePath);
-                    if (fileInfo.Length > 0) // ✅ Verificar se o arquivo não está vazio
-                    {
-                        frames.Add(new VideoFrame {
-                            Path = framePath,
-                            Timestamp = (int)timestamp,
-                            ExtractionTime = stopwatch.Elapsed.TotalSeconds
-                        });
-                        _logger.LogDebug("✅ Frame extraído: {FramePath} (t={Timestamp}s)", framePath, timestamp);
-                    } else {
-                        _logger.LogWarning("Frame vazio gerado: {FramePath}", framePath);
-                        File.Delete(framePath);
-                    }
-                } else {
-                    _logger.LogWarning("Falha ao extrair frame em t={Timestamp}s (ExitCode: {ExitCode})", timestamp, process.ExitCode);
-                    if (File.Exists(framePath)) File.Delete(framePath);
-                }
-            }
-        } catch (Exception ex) {
-            _logger.LogError(ex, "Erro na extração de frames: {Message}", ex.Message);
-        } finally {
-            stopwatch.Stop();
-        }
-
-        return frames;
-    }
-
-    /// <summary>
-    /// Detecta QR Code em um frame usando ZXing
-    /// </summary>
-    private string? DetectQRInFrame(string framePath) {
-        try {
-            using var bitmap = SKBitmap.Decode(framePath);
-            if (bitmap == null) {
-                _logger.LogDebug("Falha ao decodificar bitmap: {FramePath}", framePath);
-                return null;
-            }
-
-            // ✅ ZXing.SkiaSharp aceita SKBitmap diretamente
-            var reader = new BarcodeReader {
-                AutoRotate = true,
-                Options = new DecodingOptions {
-                    TryHarder = true,
-                    PossibleFormats = new[] { BarcodeFormat.QR_CODE }
-                }
-            };
-
-            var result = reader.Decode(bitmap);
-            if (result != null) {
-                _logger.LogDebug("QR Code detectado: {Content}", result.Text);
-            }
-
-            return result?.Text;
-        } catch (Exception ex) {
-            _logger.LogDebug(ex, "Erro na detecção de QR no frame {FramePath}", framePath);
-            return null;
-        }
-    }
-
-    /// <summary>
-    /// Limpa frames temporários
-    /// </summary>
-    private void CleanupFrames(IEnumerable<string> framePaths) {
-        try {
-            var count = 0;
-            foreach (var framePath in framePaths) {
-                if (File.Exists(framePath)) {
-                    File.Delete(framePath);
-                    count++;
-                }
-            }
-            _logger.LogDebug("🧹 {Count} frames temporários removidos", count);
-        } catch (Exception ex) {
-            _logger.LogWarning(ex, "Erro na limpeza de frames temporários");
-        }
-    }
-}
-
-/// <summary>
-/// Informações do vídeo extraídas do FFProbe
-/// </summary>
-public class VideoInfo {
-    public int Duration { get; set; }
-    public int Width { get; set; }
-    public int Height { get; set; }
-    public string Codec { get; set; } = string.Empty;
-}
-
-/// <summary>
-/// Representa um frame extraído
-/// </summary>
-public class VideoFrame {
-    public string Path { get; set; } = string.Empty;
-    public int Timestamp { get; set; }
-    public double ExtractionTime { get; set; }
-}
-
-/// <summary>
-/// Opções de processamento de vídeo
-/// </summary>
-public class VideoProcessingOptions {
-    public double DurationThreshold { get; set; } = 120;
-    public double OptimizedFps { get; set; } = 0.5;
-    public double DefaultFps { get; set; } = 1.0;
-    public int FrameQualityCrf { get; set; } = 23;
-    public string FFmpegPath { get; set; } = "/usr/bin/ffmpeg";
-}
-
-/// <summary>
-/// Opções de armazenamento
-/// </summary>
-public class VideoStorageOptions {
-    public string BasePath { get; set; } = "/uploads";
-    public string TempFramesPath { get; set; } = "/tmp/scanforge_frames";
 }
