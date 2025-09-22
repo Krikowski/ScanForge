@@ -1,124 +1,224 @@
-﻿using Microsoft.AspNetCore.SignalR.Client;
+﻿using Microsoft.AspNetCore.SignalR;
+using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using ScanForge.Models;
 using System;
+using System.Net.Http;
+using System.Text;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace ScanForge.Services;
 
-/// <summary>
-/// Serviço de notificação SignalR para conclusão de processamento
-/// </summary>
-public class SignalRNotifierService : IAsyncDisposable {
-    private readonly HubConnection _connection;
+public interface ISignalRNotifierService {
+    Task NotifyCompletionAsync(VideoResult video);
+    Task NotifyProcessingStartedAsync(int videoId, string title);
+    Task NotifyProcessingErrorAsync(int videoId, string error);
+}
+
+public class SignalRNotifierOptions {
+    public string HubUrl { get; set; } = "http://videonest_service:8080/videoHub";
+    public int MaxRetries { get; set; } = 3;
+    public int RetryDelayMs { get; set; } = 1000;
+}
+
+public class SignalRNotifierService : ISignalRNotifierService, IDisposable {
+    // ✅ CAMPOS NÃO-READONLY (podem ser atribuídos fora do construtor)
+    private HubConnection? _hubConnection;
     private readonly ILogger<SignalRNotifierService> _logger;
     private readonly string _hubUrl;
-    private bool _isConnected = false;
-    private readonly SemaphoreSlim _connectionLock = new(1, 1);
+    private readonly int _maxRetries;
+    private readonly int _retryDelayMs;
+    private readonly HttpClient _httpClient;
+    private bool _disposed = false;
 
-    /// <summary>
-    /// Inicializa conexão SignalR com VideoNest Hub
-    /// </summary>
-    /// <param name="configuration">Configuração com SignalR:HubUrl</param>
-    /// <param name="logger">Logger estruturado</param>
-    public SignalRNotifierService(IConfiguration configuration, ILogger<SignalRNotifierService> logger) {
+    // ✅ CONFIGURAÇÕES PADRÃO
+    private const int DEFAULT_MAX_RETRIES = 3;
+    private const int DEFAULT_RETRY_DELAY_MS = 1000;
+
+    public SignalRNotifierService(
+        IConfiguration configuration,
+        ILogger<SignalRNotifierService> logger) {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _hubUrl = configuration["SignalR:HubUrl"] ?? "http://videonest_service:8080/videoHub";
+        _maxRetries = configuration.GetValue<int>("SignalR:MaxRetries", DEFAULT_MAX_RETRIES);
+        _retryDelayMs = configuration.GetValue<int>("SignalR:RetryDelayMs", DEFAULT_RETRY_DELAY_MS);
 
-        _connection = new HubConnectionBuilder()
-            .WithUrl(_hubUrl)
-            .WithAutomaticReconnect()
-            .Build();
+        _httpClient = new HttpClient();
+        _httpClient.Timeout = TimeSpan.FromSeconds(10);
 
-        // Handlers de eventos de conexão
-        _connection.Closed += async (error) => {
-            _isConnected = false;
-            _logger.LogWarning("SignalR conexão fechada: {Error}", error?.Message);
-            await Task.CompletedTask;
-        };
-
-        _connection.Reconnected += async (connectionId) => {
-            _isConnected = true;
-            _logger.LogInformation("SignalR reconectado: {ConnectionId}", connectionId);
-            await Task.CompletedTask;
-        };
-
-        _logger.LogInformation("SignalRNotifier inicializado para {HubUrl}", _hubUrl);
+        // ✅ INICIALIZAÇÃO ASSÍNCRONA NO CONSTRUTOR
+        _ = InitializeConnectionAsync(); // Não aguarda - fire and forget
     }
 
-    /// <summary>
-    /// Notifica VideoNest sobre conclusão de processamento
-    /// </summary>
-    /// <param name="video">VideoResult processado</param>
-    /// <remarks>
-    /// Chama VideoNest Hub: VideoProcessed(videoId, status)
-    /// Lazy connection com retry automático
-    /// Graceful degradation se desconectado
-    /// </remarks>
+    private async Task InitializeConnectionAsync() {
+        try {
+            _logger.LogInformation("🔌 Inicializando SignalR para {_hubUrl}", _hubUrl);
+
+            var builder = new HubConnectionBuilder()
+                .WithUrl(_hubUrl, options => {
+                    options.AccessTokenProvider = () => Task.FromResult((string?)null);
+                    options.SkipNegotiation = false;
+                    options.UseDefaultCredentials = false;
+                })
+                .WithAutomaticReconnect(new[] { TimeSpan.Zero, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(10) })
+                .ConfigureLogging(logging => {
+                    logging.SetMinimumLevel(LogLevel.Warning);
+                });
+
+            _hubConnection = builder.Build();
+
+            // ✅ EVENTOS CORRIGIDOS - .NET 8 API
+            _hubConnection.Closed += async (error) => {
+                _logger.LogWarning("❌ SignalR conexão fechada: {Error}", error?.Message ?? "null");
+                await Task.CompletedTask;
+            };
+
+            _hubConnection.Reconnecting += (error) => {
+                _logger.LogWarning("🔄 SignalR reconectando: {Error}", error?.Message ?? "null");
+                return Task.CompletedTask;
+            };
+
+            _hubConnection.Reconnected += async (connectionId) => {
+                _logger.LogInformation("✅ SignalR reconectado: {ConnectionId}", connectionId);
+                await Task.CompletedTask;
+            };
+
+            // ✅ REMOVIDO: Disconnected (não existe mais na API pública)
+
+            await _hubConnection.StartAsync();
+            _logger.LogInformation("✅ SignalR conectado: {_hubUrl}", _hubUrl);
+        } catch (Exception ex) {
+            _logger.LogError(ex, "💥 Falha ao inicializar SignalR para {_hubUrl}", _hubUrl);
+            _hubConnection = null; // Para verificação posterior
+        }
+    }
+
     public async Task NotifyCompletionAsync(VideoResult video) {
-        ArgumentNullException.ThrowIfNull(video);
+        // ✅ VERIFICAÇÃO DE CONEXÃO MELHORADA
+        if (_hubConnection == null || _hubConnection.State != HubConnectionState.Connected) {
+            _logger.LogWarning("❌ SignalR não conectado (State: {_State}) - pulando notificação para VideoId={VideoId}",
+                _hubConnection?.State.ToString() ?? "null", video.VideoId);
+            return;
+        }
+
+        for (int attempt = 1; attempt <= _maxRetries; attempt++) {
+            try {
+                _logger.LogDebug("🔄 SignalR tentativa {Attempt}/{MaxRetries} para VideoId={VideoId}",
+                    attempt, _maxRetries, video.VideoId);
+
+                await _hubConnection.InvokeAsync("VideoProcessed", video);
+                _logger.LogInformation("🔔 SignalR: VideoId={VideoId} notificado ({QRsCount} QRs)",
+                    video.VideoId, video.QRCodes?.Count ?? 0);
+                return; // Sucesso!
+            } catch (HubException ex) when (attempt < _maxRetries) {
+                _logger.LogWarning(ex, "⚠️ SignalR falhou na tentativa {Attempt}/{MaxRetries} para VideoId={VideoId}: {Message}",
+                    attempt, _maxRetries, video.VideoId, ex.Message);
+                await Task.Delay(_retryDelayMs * attempt); // Backoff exponencial
+            } catch (Exception ex) {
+                _logger.LogError(ex, "💥 Erro inesperado SignalR na tentativa {Attempt} para VideoId={VideoId}",
+                    attempt, video.VideoId);
+                if (attempt == _maxRetries) // Só tenta fallback na última tentativa
+                {
+                    await FallbackHttpNotification(video);
+                }
+                break;
+            }
+        }
+
+        if (_maxRetries > 0) {
+            _logger.LogWarning("⚠️ Todas as {MaxRetries} tentativas SignalR falharam para VideoId={VideoId}",
+                _maxRetries, video.VideoId);
+        }
+    }
+
+    public async Task NotifyProcessingStartedAsync(int videoId, string title) {
+        if (_hubConnection?.State != HubConnectionState.Connected) {
+            _logger.LogDebug("SignalR indisponível - pulando notificação de início para VideoId={VideoId}", videoId);
+            return;
+        }
 
         try {
-            // Lazy connection se necessário
-            if (!_isConnected || _connection.State != HubConnectionState.Connected) {
-                await _connectionLock.WaitAsync();
-                try {
-                    if (!_isConnected) {
-                        await ConnectWithRetryAsync();
-                    }
-                } finally {
-                    _connectionLock.Release();
-                }
-            }
+            await _hubConnection.InvokeAsync("VideoProcessingStarted", new { VideoId = videoId, Title = title });
+            _logger.LogDebug("🔔 SignalR: Início do processamento notificado para VideoId={VideoId}", videoId);
+        } catch (Exception ex) {
+            _logger.LogWarning(ex, "⚠️ Falha ao notificar início do processamento para VideoId={VideoId}", videoId);
+        }
+    }
 
-            // Enviar notificação se conectado
-            if (_connection.State == HubConnectionState.Connected) {
-                await _connection.InvokeAsync("VideoProcessed", video.VideoId, video.Status);
-                _logger.LogInformation("✅ Notificação SignalR enviada: VideoId={VideoId}, Status={Status}",
-                    video.VideoId, video.Status);
+    public async Task NotifyProcessingErrorAsync(int videoId, string error) {
+        if (_hubConnection?.State != HubConnectionState.Connected) {
+            _logger.LogDebug("SignalR indisponível - pulando notificação de erro para VideoId={VideoId}", videoId);
+            return;
+        }
+
+        try {
+            await _hubConnection.InvokeAsync("VideoProcessingError", new { VideoId = videoId, Error = error });
+            _logger.LogWarning("🔔 SignalR: Erro de processamento notificado para VideoId={VideoId}", videoId);
+        } catch (Exception ex) {
+            _logger.LogError(ex, "💥 Falha ao notificar erro de processamento para VideoId={VideoId}", videoId);
+        }
+    }
+
+    // ✅ FALLBACK HTTP - Notificação via API REST se SignalR falhar
+    private async Task FallbackHttpNotification(VideoResult video) {
+        try {
+            var videoNestUrl = _hubUrl.Replace("/videoHub", "/api/videos"); // http://videonest_service:8080/api/videos
+            var updateUrl = $"{videoNestUrl}/{video.VideoId}/status";
+
+            var payload = new {
+                Status = video.Status,
+                Duration = video.Duration,
+                QRCodes = video.QRCodes?.Select(qr => new { Content = qr.Content, Timestamp = qr.Timestamp }),
+                ErrorMessage = video.ErrorMessage,
+                LastUpdated = video.LastUpdated
+            };
+
+            var json = JsonSerializer.Serialize(payload);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+
+            var response = await _httpClient.PutAsync(updateUrl, content);
+
+            if (response.IsSuccessStatusCode) {
+                _logger.LogInformation("✅ Fallback HTTP: VideoId={VideoId} atualizado via API", video.VideoId);
             } else {
-                _logger.LogWarning("⚠️ SignalR desconectado - notificação pulada: VideoId={VideoId}", video.VideoId);
+                var errorContent = await response.Content.ReadAsStringAsync();
+                _logger.LogWarning("⚠️ Fallback HTTP falhou: {StatusCode} para VideoId={VideoId}. Response: {Response}",
+                    response.StatusCode, video.VideoId, errorContent);
             }
         } catch (Exception ex) {
-            _logger.LogError(ex, "❌ Erro SignalR para VideoId={VideoId}", video.VideoId);
+            _logger.LogError(ex, "💥 Fallback HTTP falhou completamente para VideoId={VideoId}", video.VideoId);
         }
     }
 
-    /// <summary>
-    /// Conecta com retry exponencial
-    /// </summary>
-    private async Task ConnectWithRetryAsync(int maxRetries = 3) {
-        for (int retry = 1; retry <= maxRetries; retry++) {
-            try {
-                _logger.LogInformation("🔄 SignalR tentativa {Retry}/{MaxRetries} para {HubUrl}",
-                    retry, maxRetries, _hubUrl);
 
-                await _connection.StartAsync();
-                _isConnected = true;
-                _logger.LogInformation("✅ SignalR conectado: {HubUrl}", _hubUrl);
-                return;
-            } catch (Exception ex) when (retry < maxRetries) {
-                _logger.LogWarning(ex, "⚠️ SignalR tentativa {Retry} falhou, retry em 3s", retry);
-                await Task.Delay(3000);
+
+    // ✅ MÉTODO PARA FORÇAR RECONEXÃO (opcional)
+    public async Task ReconnectAsync() {
+        if (_hubConnection != null) {
+            try {
+                await _hubConnection.DisposeAsync();
             } catch (Exception ex) {
-                _logger.LogError(ex, "❌ SignalR falhou após {MaxRetries} tentativas", maxRetries);
-                _isConnected = false;
-                return;
+                _logger.LogWarning(ex, "⚠️ Erro ao descartar conexão antiga");
             }
         }
+
+        _hubConnection = null;
+        await InitializeConnectionAsync();
     }
 
-    /// <summary>
-    /// Libera recursos SignalR
-    /// </summary>
-    public async ValueTask DisposeAsync() {
-        if (_connection != null) {
+    public void Dispose() {
+        if (!_disposed) {
             try {
-                await _connection.DisposeAsync();
+                _hubConnection?.DisposeAsync().GetAwaiter().GetResult();
+                _httpClient?.Dispose();
             } catch (Exception ex) {
-                _logger.LogWarning(ex, "Erro ao dispose SignalR");
+                _logger?.LogWarning(ex, "⚠️ Erro durante dispose do SignalRNotifier");
+            } finally {
+                _disposed = true;
             }
         }
-        _connectionLock?.Dispose();
     }
 }

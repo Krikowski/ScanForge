@@ -46,10 +46,25 @@ namespace ScanForge {
                 logger.LogInformation("🚀 ScanForge Worker Service iniciando em {Environment}...",
                     builder.Environment.EnvironmentName);
 
-                // NOVA: Garantir índices uma vez no startup
+                // ✅ GARANTIR ÍNDICES UMA VEZ NO STARTUP
                 using (var scope = host.Services.CreateScope()) {
                     var repo = scope.ServiceProvider.GetRequiredService<IVideoRepository>();
-                    await repo.EnsureIndexesAsync(); // Chama a criação de índices (idempotente)
+                    await repo.EnsureIndexesAsync();
+                }
+
+                // ✅ VALIDAR CONFIGURAÇÕES (BIND DIRETO)
+                using (var scope = host.Services.CreateScope()) {
+                    var config = scope.ServiceProvider.GetRequiredService<IConfiguration>();
+                    var rabbitSection = config.GetSection("RabbitMQ");
+                    var videoSection = config.GetSection("VideoProcessing");
+                    var storageSection = config.GetSection("VideoStorage");
+
+                    logger.LogInformation("⚙️ Configurações carregadas - " +
+                        "RabbitMQ: {Host}:{Port}, Queue: {Queue}, " +
+                        "FPS: {DefaultFps}/{OptimizedFps}, Temp: {TempPath}",
+                        rabbitSection["HostName"], rabbitSection["Port"], rabbitSection["QueueName"],
+                        videoSection["DefaultFps"], videoSection["OptimizedFps"],
+                        storageSection["TempFramesPath"]);
                 }
 
                 await host.RunAsync();
@@ -61,37 +76,70 @@ namespace ScanForge {
         }
 
         private static void ConfigureServices(IServiceCollection services, IConfiguration configuration) {
-            // Worker Service principal
+            // ✅ WORKER SERVICE PRINCIPAL
             services.AddHostedService<VideoProcessorWorker>();
 
-            // MongoDB
+            // ✅ MONGODB
             services.AddSingleton<IMongoClient>(sp =>
                 new MongoClient(configuration["MongoDB:ConnectionString"] ??
-                    "mongodb://admin:admin@mongodb:27017"));
+                    "mongodb://admin:admin@mongodb_hackathon:27017"));
 
             services.AddSingleton<IMongoDatabase>(sp =>
                 sp.GetRequiredService<IMongoClient>()
                     .GetDatabase(configuration["MongoDB:DatabaseName"] ?? "Hackathon_FIAP"));
 
-            // Redis
+            // ✅ REDIS
             services.AddStackExchangeRedisCache(options => {
-                options.Configuration = configuration["Redis:ConnectionString"] ?? "redis:6379";
+                options.Configuration = configuration["Redis:ConnectionString"] ?? "redis_hackathon:6379";
                 options.InstanceName = "ScanForge:";
             });
 
-            // Repositórios
+            // ✅ REPOSITORIES
             services.AddScoped<IVideoRepository, VideoRepository>();
 
-            // Serviços principais
+            // ✅ SERVICES
             services.AddScoped<IVideoProcessingService, VideoProcessingService>();
             services.AddScoped<SignalRNotifierService>();
 
-            // Health Checks
-            services.AddHealthChecks()
-                .AddCheck("worker", () => HealthCheckResult.Healthy("Worker is running"));
+            // ✅ REGISTRO CORRIGIDO: Interface para RabbitMQ se necessário
+            // services.AddSingleton<IRabbitMQPublisher, RabbitMQPublisher>(); // Se usado no ScanForge
 
-            // Prometheus Metrics (porta 8081)
+            // ✅ HEALTH CHECKS
+            services.AddHealthChecks()
+                .AddCheck("worker", () => HealthCheckResult.Healthy("Worker is running"))
+                .AddCheck("self", () => HealthCheckResult.Healthy());
+
+            // ✅ PROMETHEUS METRICS (porta 8081)
             services.AddMetricServer(options => options.Port = 8081);
         }
+    }
+
+    // ✅ CLASSES DE CONFIGURAÇÃO SIMPLES (BIND DIRETO)
+    public class RabbitMQOptions {
+        public string HostName { get; set; } = "localhost";
+        public int Port { get; set; } = 5672;
+        public string UserName { get; set; } = "guest";
+        public string Password { get; set; } = "guest";
+        public string QueueName { get; set; } = "video_queue";
+        public string DeadLetterExchange { get; set; } = "dlx_video_exchange";
+        public string DeadLetterQueue { get; set; } = "dlq_video_queue";
+        public string VirtualHost { get; set; } = "/";
+        public int MessageTtlMilliseconds { get; set; } = 300000;
+        public int RetryAttempts { get; set; } = 3;
+        public int RetryDelaySeconds { get; set; } = 5;
+        public int HeartbeatSeconds { get; set; } = 60;
+    }
+
+    public class VideoProcessingOptions {
+        public double DurationThreshold { get; set; } = 120;
+        public double OptimizedFps { get; set; } = 0.5;
+        public double DefaultFps { get; set; } = 1.0;
+        public int FrameQualityCrf { get; set; } = 23;
+        public string FFmpegPath { get; set; } = "/usr/bin/ffmpeg";
+    }
+
+    public class VideoStorageOptions {
+        public string BasePath { get; set; } = "/uploads";
+        public string TempFramesPath { get; set; } = "/tmp/scanforge_frames";
     }
 }
