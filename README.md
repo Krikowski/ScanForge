@@ -22,30 +22,45 @@ Notificação em tempo real para clientes via SignalR (bônus).
 Métricas de performance via Prometheus (bônus).
 
 ## Justificativas Técnicas: Decisões Baseadas no Mercado
-1. Framework e Linguagem: .NET 8.0
-Ideal para workloads CPU/I/O intensivos como processamento de vídeo.
-Suporte a AOT compilation para reduzir latência.
-Integração nativa com FFMpegCore para extração de frames.
-Fácil integração com bibliotecas de QR Code (ex.: ZXing.NET).
-Amplo suporte enterprise e cloud (Azure, AWS ECS).
 
-2. Arquitetura Orientada a Serviços e Microsserviços
-O ScanForge roda isolado do VideoNest, mas ambos se comunicam via RabbitMQ, garantindo desacoplamento.
-Services, Repositories, DTOs e Controllers organizam o código de forma clara, aplicando SOLID.
-Caso o processamento falhe, o upload continua operando normalmente (resiliência).
+1. .NET 8.0
+A escolha do .NET 8.0 atende diretamente ao requisito de uso de uma linguagem madura e performática para workloads de processamento de vídeo (RF3–RF5).
+Esse framework é ideal para workloads I/O-bound (como leitura/escrita de vídeos) e CPU-bound (decodificação e análise de frames), entregando alta performance e baixo consumo de recursos.
+No código, isso aparece em métodos como:
+  var frames = await _frameExtractor.ExtractFramesAsync(message.FilePath);
+  var qrCodes = _qrDecoder.Decode(frame);
+➝ Aqui, a combinação de FFMpegCore e ZXing.NET aproveita bibliotecas consolidadas para extração de frames e leitura de QR Codes.
+Bancos como Itaú e Bradesco usam .NET em sistemas core pela confiabilidade, suporte enterprise e performance em larga escala. Isso reforça que o ScanForge usa uma base tecnológica de nível corporativo.
 
-3. Mensageria com RabbitMQ
-Recebe mensagens do VideoNest e inicia processamento assíncrono.
-Implementa Dead Letter Queue (DLQ) e retry policies, garantindo robustez em falhas.
-Justificado sobre Kafka pela simplicidade e menor overhead.
+2. Arquitetura de Microsserviços
+O ScanForge roda isolado do VideoNest, comunicando-se apenas por mensagens assíncronas (RabbitMQ). Essa separação garante resiliência: se o processamento falhar, o upload segue disponível.
+Essa escolha cumpre o requisito de arquitetura orientada a serviços e permite escalabilidade horizontal: múlticas instâncias de ScanForge podem processar vídeos em paralelo.
+Esse padrão é usado em empresas como o Spotify, onde serviços independentes (streaming, playlists, anúncios) podem escalar ou falhar sem impactar o sistema como um todo. O mesmo princípio foi aplicado aqui.
 
-4. Armazenamento e Persistência
-MongoDB: flexibilidade para armazenar resultados de análise (QR Codes e timestamps).
-Redis: suporte a cache para status de processamento, acelerando consultas.
+3. RabbitMQ (Mensageria)
+O RabbitMQ gerencia a fila de vídeos enviados pelo VideoNest, garantindo processamento assíncrono conforme os RFs exigidos no Hackathon.
+Implementamos retry automático e Dead Letter Queue (DLQ), atendendo boas práticas de resiliência exigidas em produção.
+No código, o consumo das mensagens acontece de forma desacoplada:
+public async Task ProcessMessage(VideoMessage message)
+  {
+      await _videoProcessingService.ProcessVideoAsync(message);
+  }
+Escolhemos RabbitMQ ao invés de Kafka pela simplicidade e leveza em workloads de volume médio (como uploads em lote).
+Esse mesmo modelo é usado por grandes e-commerces durante a Black Friday, para filas de pedidos – provando que a tecnologia suporta picos de demanda.
 
-5. Monitoramento e Notificações
-Prometheus: coleta métricas de tempo de processamento, taxa de sucesso e falhas.
-SignalR: envio em tempo real de atualizações de status (UX aprimorada, evita polling).
+4. MongoDB + Redis (Armazenamento e Cache)
+O MongoDB armazena resultados flexíveis do processamento (conteúdo do QR Code + timestamp). Por ser NoSQL, suporta modelos variáveis de dados, ideal para vídeos que podem ter 0, 1 ou múltiplos QR Codes.
+O Redis entra como camada de cache de status, acelerando consultas frequentes e reduzindo latência, em conformidade com o requisito de respostas rápidas ao usuário (RF6 e RF7).
+Netflix usa MongoDB para armazenar metadados de mídia (catálogos, streams).
+Twitter usa Redis para armazenar timelines e caches em tempo real.
+➝ A mesma lógica foi aplicada no ScanForge: MongoDB garante flexibilidade dos resultados, e Redis garante performance em consultas recorrentes.
+
+5. Prometheus + Logging Estruturado (Observabilidade)
+O Prometheus coleta métricas customizadas como tempo médio de processamento de um vídeo e taxa de sucesso/falhas, permitindo alertas proativos em cenários de produção.
+Exemplo no código:
+  _metrics.ObserveProcessingTime(processingDuration);
+O Serilog garante logs estruturados, com correlação de eventos (ex.: ID do vídeo + status). Isso atende ao requisito de boas práticas de arquitetura e código limpo do Hackathon.
+O ScanForge adota essa prática para oferecer rastreabilidade semelhante em escala.
 
 ## Aplicação de Princípios de Engenharia de Software
 
