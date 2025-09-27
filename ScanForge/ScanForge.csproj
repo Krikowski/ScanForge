@@ -40,8 +40,4 @@
 		<PackageReference Include="ZXing.Net" Version="0.16.9" />
 		<PackageReference Include="ZXing.Net.Bindings.SkiaSharp" Version="0.16.9" />
 	</ItemGroup>
-
-	<ItemGroup>
-		<Folder Include="wwwroot\" />
-	</ItemGroup>
 </Project>
