@@ -38,4 +38,7 @@
 	<ItemGroup>
 		<ProjectReference Include="..\ScanForge\ScanForge.csproj" />
 	</ItemGroup>
+	<ItemGroup>
+	  <Folder Include="Workers\" />
+	</ItemGroup>
 </Project>
